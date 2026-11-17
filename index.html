@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>GPS ピンポイント誘導レーダー</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background-color: #0d1117;
+    color: #e6edf3;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    padding: 12px;
+    user-select: none;
+  }
+  .panel {
+    width: 100%;
+    max-width: 420px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    padding: 12px;
+    margin-bottom: 10px;
+  }
+  .input-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .input-group {
+    flex: 1;
+  }
+  label {
+    display: block;
+    font-size: 11px;
+    color: #8b949e;
+    margin-bottom: 3px;
+  }
+  input {
+    width: 100%;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    color: #fff;
+    padding: 8px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-family: monospace;
+  }
+  .btn-row {
+    display: flex;
+    gap: 8px;
+  }
+  button {
+    flex: 1;
+    padding: 10px;
+    border: none;
+    border-radius: 6px;
+    font-weight: bold;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  #btnStart { background: #238636; color: #fff; }
+  #btnSetHere { background: #1f6feb; color: #fff; }
+  
+  .metrics {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    text-align: center;
+  }
+  .metric-box {
+    background: #0d1117;
+    padding: 8px 4px;
+    border-radius: 6px;
+    border: 1px solid #21262d;
+  }
+  .metric-val {
+    font-size: 18px;
+    font-weight: bold;
+    font-family: monospace;
+    color: #58a6ff;
+  }
+  .metric-label {
+    font-size: 10px;
+    color: #8b949e;
+  }
+
+  #canvasContainer {
+    position: relative;
+    width: 100%;
+    max-width: 360px;
+    aspect-ratio: 1 / 1;
+    margin: 4px 0;
+  }
+  canvas {
+    width: 100%;
+    height: 100%;
+    background: #090c10;
+    border-radius: 50%;
+    border: 2px solid #30363d;
+    display: block;
+  }
+  .status-bar {
+    font-size: 11px;
+    color: #8b949e;
+    text-align: center;
+    margin-top: 6px;
+    font-family: monospace;
+  }
+</style>
+</head>
+<body>
+
+<div class="panel">
+  <div class="input-row">
+    <div class="input-group">
+      <label>目標 緯度 (Latitude)</label>
+      <input type="number" id="targetLat" step="0.000001" placeholder="35.433912">
+    </div>
+    <div class="input-group">
+      <label>目標 経度 (Longitude)</label>
+      <input type="number" id="targetLon" step="0.000001" placeholder="136.782234">
+    </div>
+  </div>
+  <div class="btn-row">
+    <button id="btnStart">誘導開始 / センサー許可</button>
+    <button id="btnSetHere">現在地を目標に設定</button>
+  </div>
+</div>
+
+<div class="panel metrics">
+  <div class="metric-box">
+    <div class="metric-val" id="dispDist">---</div>
+    <div class="metric-label">残り距離</div>
+  </div>
+  <div class="metric-box">
+    <div class="metric-val" id="dispBearing">---</div>
+    <div class="metric-label">目標方位</div>
+  </div>
+  <div class="metric-box">
+    <div class="metric-val" id="dispAcc">---</div>
+    <div class="metric-label">GPS精度(±m)</div>
+  </div>
+</div>
+
+<div id="canvasContainer">
+  <canvas id="radarCanvas" width="600" height="600"></canvas>
+</div>
+
+<div class="status-bar" id="statusText">待機中：目標座標を入力して「誘導開始」を押してください</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('radarCanvas');
+  const ctx = canvas.getContext('2d');
+  const targetLatInput = document.getElementById('targetLat');
+  const targetLonInput = document.getElementById('targetLon');
+  const dispDist = document.getElementById('dispDist');
+  const dispBearing = document.getElementById('dispBearing');
+  const dispAcc = document.getElementById('dispAcc');
+  const statusText = document.getElementById('statusText');
+
+  // 保存済み座標の復元（初期値は岐阜城天守付近）
+  targetLatInput.value = localStorage.getItem('targetLat') || '35.433912';
+  targetLonInput.value = localStorage.getItem('targetLon') || '136.782234';
+
+  let currentPos = null;
+  let posHistory = []; // 移動平均フィルタ用バッファ
+  const FILTER_SIZE = 3;
+  let deviceHeading = 0; // スマホの向き（北=0, 時計回り）
+  let watchId = null;
+
+  function saveTarget() {
+    localStorage.setItem('targetLat', targetLatInput.value);
+    localStorage.setItem('targetLon', targetLonInput.value);
+  }
+  targetLatInput.addEventListener('change', saveTarget);
+  targetLonInput.addEventListener('change', saveTarget);
+
+  // 2点間の距離(m)と方位角(度: 0〜360)を計算（ヒュベニの公式簡易版 / 球面三角法）
+  function calcDistanceAndBearing(lat1, lon1, lat2, lon2) {
+    const R = 6378137.0; // WGS84 赤道半径(m)
+    const rad = Math.PI / 180;
+    const phi1 = lat1 * rad;
+    const phi2 = lat2 * rad;
+    const dPhi = (lat2 - lat1) * rad;
+    const dLambda = (lon2 - lon1) * rad;
+
+    const a = Math.sin(dPhi / 2) ** 2 +
+              Math.cos(phi1) * Math.cos(phi2) * Math.sin(dLambda / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    const distance = R * c;
+
+    const y = Math.sin(dLambda) * Math.cos(phi2);
+    const x = Math.cos(phi1) * Math.sin(phi2) -
+              Math.sin(phi1) * Math.cos(phi2) * Math.cos(dLambda);
+    let bearing = Math.atan2(y, x) / rad;
+    bearing = (bearing + 360) % 360;
+
+    return { distance, bearing };
+  }
+
+  // 移動平均による座標平滑化
+  function addFilteredPosition(lat, lon, accuracy) {
+    posHistory.push({ lat, lon });
+    if (posHistory.length > FILTER_SIZE) posHistory.shift();
+    const sum = posHistory.reduce((acc, p) => ({ lat: acc.lat + p.lat, lon: acc.lon + p.lon }), { lat: 0, lon: 0 });
+    return {
+      lat: sum.lat / posHistory.length,
+      lon: sum.lon / posHistory.length,
+      accuracy
+    };
+  }
+
+  // センサーとGPSの起動
+  document.getElementById('btnStart').addEventListener('click', async () => {
+    saveTarget();
+
+    // iOS Safari向けコンパスの許可リクエスト
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+      try {
+        const res = await DeviceOrientationEvent.requestPermission();
+        if (res === 'granted') {
+          window.addEventListener('deviceorientation', handleOrientation);
+        }
+      } catch (e) {
+        console.warn(e);
+      }
+    } else {
+      // Android Chrome向け（絶対方位優先）
+      window.addEventListener('deviceorientationabsolute', handleOrientation, true);
+      window.addEventListener('deviceorientation', handleOrientation, true);
+    }
+
+    if (!('geolocation' in navigator)) {
+      statusText.textContent = 'エラー: このブラウザはGPSに対応していません';
+      return;
+    }
+
+    if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+    posHistory = [];
+    statusText.textContent = 'GPS測位中... 空の開けた場所で数秒お待ちください';
+
+    watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        const { latitude, longitude, accuracy } = pos.coords;
+        currentPos = addFilteredPosition(latitude, longitude, accuracy);
+        statusText.textContent = `現在地: ${currentPos.lat.toFixed(6)}, ${currentPos.lon.toFixed(6)}`;
+      },
+      (err) => {
+        statusText.textContent = `GPSエラー (${err.code}): ${err.message}`;
+      },
+      {
+        enableHighAccuracy: true,
+        maximumAge: 0,
+        timeout: 10000
+      }
+    );
+  });
+
+  // テスト用：現在地をそのまま目標座標にセット
+  document.getElementById('btnSetHere').addEventListener('click', () => {
+    if (!currentPos) {
+      alert('先に「誘導開始」を押して現在地を取得してください。');
+      return;
+    }
+    targetLatInput.value = currentPos.lat.toFixed(6);
+    targetLonInput.value = currentPos.lon.toFixed(6);
+    saveTarget();
+  });
+
+  function handleOrientation(event) {
+    if (event.webkitCompassHeading !== undefined) {
+      deviceHeading = event.webkitCompassHeading;
+    } else if (event.alpha !== null) {
+      // Androidのabsolute方位は反時計回りなので360から引く
+      deviceHeading = (360 - event.alpha) % 360;
+    }
+  }
+
+  // 描画ループ (60fps)
+  function draw() {
+    const w = canvas.width;
+    const h = canvas.height;
+    const cx = w / 2;
+    const cy = h / 2;
+    const radius = w * 0.44;
+
+    ctx.clearRect(0, 0, w, h);
+
+    const tLat = parseFloat(targetLatInput.value);
+    const tLon = parseFloat(targetLonInput.value);
+
+    let dist = null;
+    let bearing = 0;
+
+    if (currentPos && !isNaN(tLat) && !isNaN(tLon)) {
+      const res = calcDistanceAndBearing(currentPos.lat, currentPos.lon, tLat, tLon);
+      dist = res.distance;
+      bearing = res.bearing;
+
+      dispDist.textContent = dist >= 1000 ? `${(dist / 1000).toFixed(2)}km` : `${dist.toFixed(1)}m`;
+      dispBearing.textContent = `${Math.round(bearing)}°`;
+      dispAcc.textContent = `±${currentPos.accuracy.toFixed(1)}m`;
+    }
+
+    // 1. レーダー外周と方位目盛り（スマホの向きに合わせて回転）
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate((-deviceHeading * Math.PI) / 180);
+
+    // 同心円グリッド
+    const isCloseMode = dist !== null && dist <= 10.0; // 10m以内は精密レーダーモード
+    const rings = isCloseMode ? [0.2, 0.4, 0.6, 0.8, 1.0] : [0.5, 1.0]; // 10mモード時は2m刻み
+    ctx.strokeStyle = isCloseMode ? '#1f6feb55' : '#30363d';
+    ctx.lineWidth = 2;
+    rings.forEach(r => {
+      ctx.beginPath();
+      ctx.arc(0, 0, radius * r, 0, Math.PI * 2);
+      ctx.stroke();
+    });
+
+    // 東西南北ラベル
+    ctx.fillStyle = '#8b949e';
+    ctx.font = 'bold 22px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const dirs = [{ t: 'N', a: 0, c: '#f85149' }, { t: 'E', a: 90 }, { t: 'S', a: 180 }, { t: 'W', a: 270 }];
+    dirs.forEach(d => {
+      const rad = ((d.a - 90) * Math.PI) / 180;
+      ctx.fillStyle = d.c || '#8b949e';
+      ctx.fillText(d.t, Math.cos(rad) * (radius + 20), Math.sin(rad) * (radius + 20));
+    });
+
+    ctx.restore();
+
+    // 2. スマホの正面ライン（上向き固定の基準線）
+    ctx.strokeStyle = '#ffffff33';
+    ctx.setLineDash([6, 6]);
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - radius);
+    ctx.lineTo(cx, cy + radius);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 3. 誘導表示の描画
+    if (dist !== null) {
+      // スマホの正面から見た目標への相対角度
+      const relAngleRad = ((bearing - deviceHeading) * Math.PI) / 180;
+
+      if (isCloseMode) {
+        // 【精密レーダーモード（半径10m以内）】
+        // 中央（cx, cy）＝ 目標地点（ターゲット）
+        ctx.strokeStyle = '#3fb950';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(cx - 18, cy); ctx.lineTo(cx + 18, cy);
+        ctx.moveTo(cx, cy - 18); ctx.lineTo(cx, cy + 18);
+        ctx.stroke();
+
+        // 2mごとの距離ラベル
+        ctx.fillStyle = '#58a6ff99';
+        ctx.font = '14px monospace';
+        ctx.fillText('2m', cx + 10, cy - radius * 0.2);
+        ctx.fillText('6m', cx + 10, cy - radius * 0.6);
+        ctx.fillText('10m', cx + 10, cy - radius * 1.0);
+
+        // 自分の現在位置（目標から見て逆方向 = relAngleRad + Math.PI に配置）
+        const scale = radius / 10.0; // 10m = radius px
+        const myDistPx = Math.min(dist * scale, radius);
+        const myAngle = relAngleRad + Math.PI;
+        const myX = cx + Math.sin(myAngle) * myDistPx;
+        const myY = cy - Math.cos(myAngle) * myDistPx;
+
+        // GPS誤差円（Accuracy）の可視化
+        if (currentPos.accuracy) {
+          ctx.fillStyle = 'rgba(88, 166, 255, 0.15)';
+          ctx.beginPath();
+          ctx.arc(myX, myY, Math.min(currentPos.accuracy * scale, radius), 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        // 自分を示す青いマーカー（上向き三角形）
+        ctx.fillStyle = '#58a6ff';
+        ctx.beginPath();
+        ctx.moveTo(myX, myY - 14);
+        ctx.lineTo(myX - 10, myY + 10);
+        ctx.lineTo(myX + 10, myY + 10);
+        ctx.closePath();
+        ctx.fill();
+
+        // 到達判定（1.5m以内）
+        if (dist <= 1.5) {
+          ctx.fillStyle = '#3fb950';
+          ctx.font = 'bold 26px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText('TARGET REACHED', cx, cy + radius - 30);
+        }
+
+      } else {
+        // 【アプローチモード（10m以上離れている時）：大きな誘導矢印】
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(relAngleRad);
+
+        ctx.fillStyle = '#f0883e';
+        ctx.beginPath();
+        ctx.moveTo(0, -radius * 0.72);
+        ctx.lineTo(48, 30);
+        ctx.lineTo(16, 15);
+        ctx.lineTo(16, radius * 0.55);
+        ctx.lineTo(-16, radius * 0.55);
+        ctx.lineTo(-16, 15);
+        ctx.lineTo(-48, 30);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    requestAnimationFrame(draw);
+  }
+
+  requestAnimationFrame(draw);
+})();
+</script>
+</body>
+</html>
